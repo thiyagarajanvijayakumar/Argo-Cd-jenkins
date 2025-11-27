@@ -1,0 +1,155 @@
+pipeline {
+    agent { label 'ci-node' }
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'develop', description: 'Git branch to build')
+        choice(
+            choices: ['web'],
+            name: 'APPLICATION'
+        )
+    }
+
+    environment {
+        DOCKERHUB  = 'dockerhub.pheonixsolutions.com'
+        IMAGE_WEB  = 'dev-team/dev-aaleepheonixsolutions-intelligence'
+        TAG        = "${BUILD_NUMBER}"
+
+        VAULT_ADDR            = 'https://vault.pheonixsolutions.com'
+        GITLAB_URL            = 'https://git.pheonixsolutions.com/products/apps/intelligence-app.git'
+        GITLAB_CREDENTIALS_ID = 'Gitlab Token Global'
+
+        // ArgoCD via IP
+        ARGOCD_SERVER   = '69.197.129.10:31894'
+        ARGOCD_APP_NAME = 'dev-aaleepheonixsolutions-intelligence-web'
+    }
+
+    stages {
+
+        stage('Checkout Git') {
+            steps {
+                script {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: params.BRANCH]],
+                        userRemoteConfigs: [[
+                            url: env.GITLAB_URL,
+                            credentialsId: env.GITLAB_CREDENTIALS_ID
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('Cleanup lockfiles') {
+            steps {
+                script {
+                    def appPath = (params.APPLICATION == 'web') ? 'web' : error("Unknown application")
+
+                    dir(appPath) {
+                        sh '''
+                        rm -f package-lock.json || true
+                        rm -f yarn.lock || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve and Store Secret') {
+            steps {
+                withCredentials([string(credentialsId: 'vault-secret-token', variable: 'VAULT_TOKEN')]) {
+                    script {
+                        def appPath = (params.APPLICATION == 'web') ? 'web' : error("Unknown application")
+
+                        dir(appPath) {
+                            sh '''
+                            set -e
+                            export VAULT_ADDR=${VAULT_ADDR}
+                            export VAULT_TOKEN=${VAULT_TOKEN}
+
+                            # UPDATED VAULT PATH
+                            secret_json=$(vault kv get -format=json internal/dev-intelligence-app)
+
+                            clean_json=$(echo "$secret_json" | sed ':a;N;$!ba;s/\\n//g')
+                            echo "$clean_json" | jq -r '.data.data | to_entries | .[] | "\\(.key)=\\(.value)"' > .env
+
+                            cat .env
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build and Tag Docker Image') {
+            steps {
+                script {
+                    def imageName = env.IMAGE_WEB
+                    def localTag = "dev-intelligence-app"
+                    def cacheImage = "${DOCKERHUB}/${imageName}:cache"
+
+                    dir("web") {
+                        withCredentials([usernamePassword(credentialsId: 'dockerhub-login', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                            sh """
+                                echo "$DOCKER_PASS" | docker login ${DOCKERHUB} -u "$DOCKER_USER" --password-stdin
+
+                                docker buildx ls | grep mybuilder || docker buildx create --use --name mybuilder --driver docker-container
+                                docker buildx inspect --bootstrap
+
+                                docker buildx build -t ${localTag} -f Dockerfile . \
+                                    --cache-from type=registry,ref=${cacheImage} \
+                                    --cache-to type=registry,ref=${cacheImage},mode=min \
+                                    --load
+
+                                docker tag ${localTag} ${DOCKERHUB}/${imageName}:${TAG}
+                                docker tag ${localTag} ${DOCKERHUB}/${imageName}:latest
+
+                                docker logout ${DOCKERHUB}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push to DockerHub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-login', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    script {
+                        sh """
+                        echo "$DOCKER_PASS" | docker login ${DOCKERHUB} -u "$DOCKER_USER" --password-stdin
+                        docker push ${DOCKERHUB}/${IMAGE_WEB}:${TAG}
+                        docker push ${DOCKERHUB}/${IMAGE_WEB}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy via Argo CD') {
+            steps {
+                withCredentials([string(credentialsId: 'argocd-auth-token', variable: 'ARGOCD_AUTH_TOKEN')]) {
+                    script {
+                        sh """
+                        argocd login ${ARGOCD_SERVER} \
+                            --grpc-web \
+                            --insecure \
+                            --auth-token ${ARGOCD_AUTH_TOKEN}
+
+                        argocd app set ${ARGOCD_APP_NAME} -p image.tag=${TAG}
+
+                        argocd app sync ${ARGOCD_APP_NAME} --grpc-web
+                        argocd app wait ${ARGOCD_APP_NAME} --sync --health --grpc-web
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Clean Docker Artifacts') {
+            steps {
+                sh 'docker system prune -f || true'
+            }
+        }
+    }
+}
